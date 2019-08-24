@@ -8,6 +8,7 @@ import datetime
 import pymongo
 
 import pytz
+from bson import ObjectId
 from urllib3 import disable_warnings
 import json
 import time
@@ -18,43 +19,35 @@ disable_warnings()
 exchange_info = {
     'url_map': {
         'BN': 'https://api.binance.com/api/v1/klines?symbol={symbol}&interval={interval}&startTime={start_time}&endTime={end_time}&limit=1000',
-        # 'HB': 'https://api.huobi.pro/market/history/kline?period={interval}&size=2000&symbol={symbol}'
         'BF': 'https://api-pub.bitfinex.com/v2/candles/trade:{interval}:{symbol}/hist?start={start_time}&end={end_time}&limit=5000&sort=-1'
     },
-}
-interval_map = {
-    'BN': {
-        '1m': '1m',
-        '5m': '5m',
-        '15m': '15m',
-        '30m': '30m',
-        '1h': '1h',
-        '1d': '1d'
+    'interval_redis_map': {
+        'BN': {
+            '1m': '1m',
+            '5m': '5m',
+            '15m': '15m',
+            '30m': '30m',
+            '1h': '1h',
+            '1d': '1d'
+        },
+        'BF': {
+            '1m': '1m',
+            '5m': '5m',
+            '15m': '15m',
+            '30m': '30m',
+            '1h': '1h',
+            '1d': '1D'
+        }
     },
-    'HB': {
-        '1m': '1min',
-        '5m': '5min',
-        '15m': '15min',
-        '30m': '30min',
-        '1h': '60min',
-        '1d': '1day'
-    },
-    'BF': {
-        '1m': '1m',
-        '5m': '5m',
-        '15m': '15m',
-        '30m': '30m',
-        '1h': '1h',
-        '1d': '1D'
-    },
-    'interval_min': {
+    'interval_min_map': {
         '1m': 1,
         '5m': 5,
         '15m': 15,
         '30m': 30,
         '1h': 60,
         '1d': 60 * 24
-    }
+    },
+
 }
 
 
@@ -91,22 +84,23 @@ class SymbolKline:
         self.interval = interval
         self.start_time = start_time - start_time % 60 * 1000
         self.req_count = 1000
-        self.end_time = min(self.start_time + (self.req_count - 5) * 60 * 1000 * interval_map['interval_min'][self.interval],stop_time)
+        self.end_time = min(
+            self.start_time + (self.req_count - 5) * 60 * 1000 * exchange_info['interval_min_map'][self.interval], stop_time)
         self.stop_time = stop_time
-        self.retry = True
         self.finish = False
         self.last_data_time = None
 
     def make_url(self):
         url = exchange_info['url_map'][self.exchange].format(start_time=self.start_time,
                                                              end_time=self.end_time if self.end_time < self.stop_time else self.stop_time,
-                                                             interval=interval_map[self.exchange][self.interval],
+                                                             interval=exchange_info['interval_redis_map'][self.exchange][self.interval],
                                                              symbol=self.exchangeSymbolPair if self.exchange != 'BF' else 't' + self.exchangeSymbolPair.upper())
         return url
 
     def make_next_start_time(self):
         self.start_time = self.end_time
-        self.end_time = self.end_time + (self.req_count - 5) * 60 * 1000 * interval_map['interval_min'][self.interval]
+        self.end_time = min(
+            self.end_time + (self.req_count - 5) * 60 * 1000 * exchange_info['interval_min_map'][self.interval], stop_time)
 
     async def fetch(self, session_maker: SessionMaker, params=None, headers=None):
         url = self.make_url()
@@ -120,34 +114,33 @@ class SymbolKline:
             }
         try:
             async with session_maker.session.request(
-                    proxy=session_maker.socks,proxy_auth=session_maker.auth,
-                    method='GET',timeout=10,
-                    url=url,params=params,
-                    headers=headers,ssl=False) as response:
+                    proxy=session_maker.socks, proxy_auth=session_maker.auth,
+                    method='GET', timeout=10,
+                    url=url, params=params,
+                    headers=headers, ssl=False) as response:
                 res = await response.text()
                 res = json.loads(res)
                 assert type(res) is list
+                # 成功
                 if res:
                     await self.parse_data(res)
-
-                redis_key = 'KlineEndTime:{exchange}:{trade_type}:{interval}:{symbol_name}'.format(
-                    exchange=self.exchange,
-                    trade_type=self.trade_type,
-                    interval=self.interval,
-                    symbol_name=self.symbol_name
-                )
-                await self.redis_helper.save_time(redis_key, self.end_time)
-                self.retry = False
+                else:
+                    redis_key = 'KlineEndTime:{exchange}:{trade_type}:{interval}:{symbol_name}'.format(
+                        exchange=self.exchange,
+                        trade_type=self.trade_type,
+                        interval=self.interval,
+                        symbol_name=self.symbol_name
+                    )
+                    await self.redis_helper.save_time(redis_key, self.end_time)
                 if self.end_time >= self.stop_time:
                     self.finish = True
                 else:
                     self.make_next_start_time()
                 print('成功++ {}'.format(url))
         except Exception as e:
-            # print(e)
-            # print(res)
+            print(res)
+            print(e)
             print('失败-- {} {}'.format(url, self.symbol_name))
-            self.retry = True
         await asyncio.sleep(0)
 
     def timesamp_to_datetime(self, time_stamp):
@@ -169,19 +162,37 @@ class SymbolKline:
                 # print('跳过 {} '.format(self.timesamp_to_datetime(item[0])))
                 continue
             final_data = {
+                '_id':'{trade_type}:{symbol}:{interval}:{timestamp}'.format(
+                    trade_type=self.trade_type,
+                    symbol=self.symbol_name,
+                    interval=self.interval,
+                    timestamp=item[0]
+                ),
                 'MoSymbol': self.symbol_name,
                 "BaseSymbol": BaseSymbol,
                 "QuoteSymbol": QuoteSymbol,
                 "TradeType": self.trade_type,
                 "Interval": self.interval,
                 'DateTime': self.timesamp_to_datetime(item[0]),
-                'Timestamp': item[0],
-                'Open': item[1],
-                'High': item[2],
-                'Low': item[3],
-                'Close': item[4],
-                'Vol': item[5],
             }
+            if self.exchange == 'BN':
+                final_data.update({
+                    'Timestamp': item[0],
+                    'Open': item[1],
+                    'High': item[2],
+                    'Low': item[3],
+                    'Close': item[4],
+                    'Vol': item[5]
+                })
+            elif self.exchange == 'BF':
+                final_data.update({
+                    'Timestamp': item[0],
+                    'Open': item[1],
+                    'High': item[3],
+                    'Low': item[4],
+                    'Close': item[2],
+                    'Vol': item[5]
+                })
             await self.mongodb.save_data(final_data, self.stop_time)
         if data:
             self.last_data_time = data[-1][0]
@@ -262,8 +273,12 @@ class SymbolHelper:
 
 class MongodbHelper:
     def __init__(self, exchange, redis_helper):
-        self.conn = pymongo.MongoClient('mongodb://{host}:{port}'.format(host='localhost', port=27017),
-                                        socketTimeoutMS=60000)
+        try:
+            self.conn = pymongo.MongoClient('mongodb://{host}:{port}'.format(host='localhost', port=27017),
+                                            socketTimeoutMS=60000)
+        except:
+            print('mongodb 连接失败')
+            exit()
         self.exchange = exchange
         self.my_set = eval('self.conn.{}.Kline'.format(self.exchange))
         self.last_time_dic = {}
@@ -282,17 +297,22 @@ class MongodbHelper:
     async def execute_save(self):
         # start_time = time.time()
         if self.save_cache:
-            self.my_set.insert_many(self.save_cache)
-
+            try:
+                self.my_set.insert_many(self.save_cache)
+            except Exception as e:
+                for op in e.details['writeErrors']:
+                    print(op['errmsg'])
+                raise Exception("插入数据库错误")
             redis_key = 'KlineEndTime:{exchange}:{trade_type}:{interval}:{symbol_name}'.format(
                 exchange=self.exchange,
                 trade_type=self.save_cache[-1]['TradeType'],
                 interval=self.save_cache[-1]['Interval'],
                 symbol_name=self.save_cache[-1]['MoSymbol']
             )
-            await self.redis_helper.save_time(redis_key, self.save_cache[-1]['Timestamp'])
-            # print('mongodb 写入成功 {} 条数据, 耗时: {}'.format(len(self.save_cache), time.time() - start_time))
+            last_time = self.save_cache[-1]['Timestamp']
             self.save_cache = []
+            await self.redis_helper.save_time(redis_key, last_time)
+            # print('mongodb 写入成功 {} 条数据, 耗时: {}'.format(len(self.save_cache), time.time() - start_time))
 
     def query_last_timestamp(self, symbol, trade_type, interval):
         query_str = {"Symbol": symbol, 'TradeType': trade_type, "Interval": interval}
@@ -304,9 +324,13 @@ class AsyncRedisHelper:
         self.pool = None
 
     async def make_pool(self):
-        self.pool = await aioredis.create_pool(
-            'redis://192.168.106.217',
-            minsize=5, maxsize=10)
+        try:
+            self.pool = await aioredis.create_pool(
+                'redis://127.0.0.1',
+                minsize=5, maxsize=10)
+        except:
+            print('redis 连接失败')
+            exit()
 
     async def get_data(self, key):
         with await self.pool as conn:  # low-level redis connection
@@ -332,7 +356,7 @@ async def main():
     await redis_helper.make_pool()
 
     for interval in ['1d', '1h', '5m', '30m', '15m', '1m']:
-        exchanges = ['BN', 'BF']
+        exchanges = ['BF']
         all_klines = []
         MongodbHelperList = {}
         for exchange in exchanges:
@@ -355,16 +379,10 @@ async def main():
             if for_req_kline:
                 finish = False
                 while not finish:
-                    # change_proxy_flag = 0
                     tasks = []
                     for kline_item in for_req_kline:
                         if not kline_item.finish:
-                            # change_proxy_flag += 1
                             tasks.append(kline_item.fetch(session_maker))
-                    # req_count = len(tasks)
-                    # # 切换代理
-                    # if req_count and change_proxy_flag >= req_count / 2:
-                    #     switch_tor_ip()
                     await asyncio.gather(*tasks)
                     print('')
                     finish = True
@@ -385,15 +403,16 @@ async def main():
 async def switch_tor_ip():
     with Controller.from_port(address='173.242.115.6', port=9051) as controller:
         while True:
+            await asyncio.sleep(60)
             try:
                 controller.authenticate()
                 controller.signal(Signal.NEWNYM)
                 print('切换代理中...')
-                await asyncio.sleep(12)
+                for i in range(12):
+                    time.sleep(1)
                 print('切换代理成功 ...')
             except:
                 pass
-            await asyncio.sleep(60)
 
 
 # 创建Kline请求对象
@@ -430,10 +449,10 @@ proxy = 'socks5://173.242.115.6:9050'  # 'http://173.242.115.6:8118'
 
 count = 10
 
-start_time = 1501516800000
+start_time = 1483228800000
 
 # start_time = 1565381120000
-stop_time = 1566316800000
+stop_time = 1566345600000
 # https://api-pub.bitfinex.com/v2/candles/trade:1m:tBTCUSD/hist?limit=1000&start=1523716800000&end=1523717800000&sort=-1
 # https://api-pub.bitfinex.com/v2/candles/trade:1m:tBTCUST/hist?start=1523476800000&end=1523536800000&limit=5000
 if __name__ == '__main__':
